@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+gideon.key
+gideon_vault.db
+gideon_vault.db-journal
+voiceprint.enc
