@@ -1,18 +1,27 @@
 """
-Gideon - Encrypted Memory Vault
+Gideon - Encrypted Vault (Level 3)
 
-Stores memories in a local SQLite database (gideon_vault.db). Every memory is
-encrypted with Fernet (AES-128-CBC + HMAC-SHA256, authenticated encryption)
-from the `cryptography` library before it touches the disk.
+Everything Gideon remembers is stored in one local SQLite database
+(gideon_vault.db). Every record is encrypted with Fernet (AES-128-CBC +
+HMAC-SHA256, authenticated encryption) from the `cryptography` library before
+it touches the disk.
 
-What is encrypted:  category, text, and timestamp (all inside one encrypted blob).
-What is NOT encrypted: the row id and the size of each blob (so an attacker with
-only the database file can see roughly how many memories exist, nothing more).
+Tables (each row is: id + one encrypted blob):
+  memories      goals, projects, coursework, personal context
+  tasks         things you said you need to do, with done/not done
+  reminders     deadlines, exam dates, reminders
+  security_log  voice lock events (intrusion attempts, enrollment, resets)
 
-The encryption key lives in gideon.key next to this file. It is generated
+What is encrypted: all text, categories, dates, and flags (inside the blob).
+What is NOT encrypted: row ids and blob sizes. An attacker holding only the
+database file can see roughly how many records exist and nothing else.
+
+The encryption key lives in gideon.key next to this file and is generated
 automatically on first run. Anyone who has BOTH files can read the vault, so
-never commit gideon.key or gideon_vault.db to Git and never store them together
+never commit gideon.key or gideon_vault.db to Git and never keep them together
 in a shared or cloud-synced folder.
+
+The same key also encrypts voiceprint.enc (see voicelock.py).
 """
 
 from __future__ import annotations
@@ -26,7 +35,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -37,6 +46,11 @@ DB_PATH = BASE_DIR / "gideon_vault.db"
 VALID_CATEGORIES = ("goal", "project", "coursework", "context")
 UNREADABLE = "unreadable"
 MAX_MEMORY_CHARS = 200
+MAX_TASK_CHARS = 160
+MAX_REMINDER_CHARS = 160
+MAX_LOG_DETAIL_CHARS = 300
+
+_TABLES = ("memories", "tasks", "reminders", "security_log")
 
 # Things Gideon must never store, even if the language model suggests them:
 # credentials, government/financial ID numbers, phone numbers, and email addresses.
@@ -51,7 +65,7 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
 class VaultError(Exception):
-    """Raised when the vault key or database cannot be used."""
+    """Raised when the vault key or an encrypted file cannot be used."""
 
 
 @dataclass(frozen=True)
@@ -62,9 +76,53 @@ class Memory:
     created_at: str
 
 
+@dataclass(frozen=True)
+class Task:
+    id: int
+    text: str
+    done: bool
+    created_at: str
+
+
+@dataclass(frozen=True)
+class Reminder:
+    id: int
+    title: str
+    due: str  # "YYYY-MM-DD", or "" when no date was given
+    created_at: str
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    id: int
+    timestamp: str
+    event: str
+    detail: str
+
+
 def looks_sensitive(text: str) -> bool:
     """Return True if the text looks like a credential, ID number, phone, or email."""
     return bool(_SENSITIVE_WORDS.search(text) or _LONG_NUMBER.search(text) or _EMAIL.search(text))
+
+
+def normalize_due(value: Any) -> str:
+    """Return a valid YYYY-MM-DD string, or "" if the value is not a real date."""
+    try:
+        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return ""
+
+
+def _clean(text: Any, limit: int) -> str:
+    return " ".join(str(text).split())[:limit].strip()
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _now_seconds() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _restrict_to_current_user(path: Path) -> None:
@@ -120,45 +178,93 @@ class Vault:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
-        # Overwrite deleted content with zeros so erased memories do not linger in free pages.
+        # Overwrite deleted content with zeros so erased records do not linger in free pages.
         conn.execute("PRAGMA secure_delete = ON")
         return conn
 
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS memories ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "payload BLOB NOT NULL)"
-            )
+            for table in _TABLES:
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "payload BLOB NOT NULL)"
+                )
             conn.commit()
 
-    def _encrypt(self, category: str, text: str, created_at: str) -> bytes:
-        blob = json.dumps({"c": category, "t": text, "d": created_at}, ensure_ascii=False)
-        return self._fernet.encrypt(blob.encode("utf-8"))
+    @staticmethod
+    def _check_table(table: str) -> str:
+        if table not in _TABLES:
+            raise ValueError(f"Unknown vault table: {table}")
+        return table
 
-    def _decrypt(self, row_id: int, payload: bytes) -> Memory:
+    def _seal(self, record: Dict[str, Any]) -> bytes:
+        return self._fernet.encrypt(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+
+    def _open(self, payload: bytes) -> Optional[Dict[str, Any]]:
         try:
             data = json.loads(self._fernet.decrypt(bytes(payload)).decode("utf-8"))
-            return Memory(
-                id=row_id,
-                category=str(data.get("c", "context")),
-                text=str(data.get("t", "")),
-                created_at=str(data.get("d", "")),
-            )
         except (InvalidToken, ValueError, UnicodeDecodeError):
-            return Memory(
-                id=row_id,
-                category=UNREADABLE,
-                text="This entry could not be decrypted (wrong key or damaged data). You can delete it.",
-                created_at="",
-            )
+            return None
+        return data if isinstance(data, dict) else None
 
-    # ----- public API --------------------------------------------------------
+    def _insert(self, table: str, record: Dict[str, Any]) -> int:
+        table = self._check_table(table)
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(f"INSERT INTO {table} (payload) VALUES (?)", (self._seal(record),))
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def _fetch(self, table: str) -> List[Tuple[int, Optional[Dict[str, Any]]]]:
+        """All rows oldest first. The record is None if it cannot be decrypted."""
+        table = self._check_table(table)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(f"SELECT id, payload FROM {table} ORDER BY id ASC").fetchall()
+        return [(int(row_id), self._open(payload)) for row_id, payload in rows]
+
+    def _update(self, table: str, row_id: int, record: Dict[str, Any]) -> bool:
+        table = self._check_table(table)
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(f"UPDATE {table} SET payload = ? WHERE id = ?", (self._seal(record), row_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def _remove(self, table: str, row_id: int) -> bool:
+        table = self._check_table(table)
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def _wipe(self, table: str) -> int:
+        table = self._check_table(table)
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(f"DELETE FROM {table}")
+            removed = cursor.rowcount
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table,))
+            conn.commit()
+            conn.execute("VACUUM")
+        return removed
+
+    # ----- raw encryption (used for voiceprint.enc) ----------------------------
+
+    def encrypt_bytes(self, data: bytes) -> bytes:
+        return self._fernet.encrypt(data)
+
+    def decrypt_bytes(self, token: bytes) -> bytes:
+        try:
+            return self._fernet.decrypt(token)
+        except InvalidToken as exc:
+            raise VaultError(
+                "This encrypted file cannot be decrypted with the current gideon.key "
+                "(wrong key or damaged data)."
+            ) from exc
+
+    # ----- memories ----------------------------------------------------------
 
     def add(self, category: str, text: str) -> Optional[int]:
         """Encrypt and save one memory. Returns its id, or None if it was skipped."""
-        text = " ".join(text.split())[:MAX_MEMORY_CHARS].strip()
+        text = _clean(text, MAX_MEMORY_CHARS)
         if not text or looks_sensitive(text):
             return None
         if category not in VALID_CATEGORIES:
@@ -167,40 +273,43 @@ class Vault:
         existing = {m.text.casefold() for m in self.list_all() if m.category != UNREADABLE}
         if text.casefold() in existing:
             return None
-
-        created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-        payload = self._encrypt(category, text, created_at)
-        with closing(self._connect()) as conn:
-            cursor = conn.execute("INSERT INTO memories (payload) VALUES (?)", (payload,))
-            conn.commit()
-            return cursor.lastrowid
+        return self._insert("memories", {"c": category, "t": text, "d": _now()})
 
     def list_all(self) -> List[Memory]:
-        """Return every memory, decrypted, newest first."""
-        with closing(self._connect()) as conn:
-            rows = conn.execute("SELECT id, payload FROM memories ORDER BY id DESC").fetchall()
-        return [self._decrypt(row_id, payload) for row_id, payload in rows]
+        """Every memory, decrypted, newest first."""
+        memories: List[Memory] = []
+        for row_id, record in reversed(self._fetch("memories")):
+            if record is None:
+                memories.append(
+                    Memory(
+                        id=row_id,
+                        category=UNREADABLE,
+                        text="This entry could not be decrypted (wrong key or damaged data). You can delete it.",
+                        created_at="",
+                    )
+                )
+            else:
+                memories.append(
+                    Memory(
+                        id=row_id,
+                        category=str(record.get("c", "context")),
+                        text=str(record.get("t", "")),
+                        created_at=str(record.get("d", "")),
+                    )
+                )
+        return memories
 
     def count(self) -> int:
         with closing(self._connect()) as conn:
             return int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
 
     def delete(self, memory_id: int) -> bool:
-        """Permanently erase one memory. Returns True if a row was removed."""
-        with closing(self._connect()) as conn:
-            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-            conn.commit()
-            return cursor.rowcount > 0
+        """Permanently erase one memory."""
+        return self._remove("memories", memory_id)
 
     def clear_all(self) -> int:
         """Permanently erase every memory and compact the database file."""
-        with closing(self._connect()) as conn:
-            cursor = conn.execute("DELETE FROM memories")
-            removed = cursor.rowcount
-            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'memories'")
-            conn.commit()
-            conn.execute("VACUUM")
-        return removed
+        return self._wipe("memories")
 
     def summary_for_prompt(self, max_items: int = 20, max_chars: int = 1400) -> str:
         """A compact plain-text digest of recent memories for Gideon's system prompt."""
@@ -214,3 +323,115 @@ class Vault:
             lines.append(line)
             used += len(line) + 1
         return "\n".join(lines)
+
+    # ----- tasks -------------------------------------------------------------
+
+    def add_task(self, text: str) -> Optional[int]:
+        """Save a task. Returns its id, or None if skipped (empty, sensitive, or already open)."""
+        text = _clean(text, MAX_TASK_CHARS)
+        if not text or looks_sensitive(text):
+            return None
+        open_texts = {t.text.casefold() for t in self.list_tasks() if not t.done}
+        if text.casefold() in open_texts:
+            return None
+        return self._insert("tasks", {"t": text, "x": 0, "d": _now()})
+
+    def list_tasks(self) -> List[Task]:
+        """Open tasks first (oldest first), then completed tasks (newest first)."""
+        tasks: List[Task] = []
+        for row_id, record in self._fetch("tasks"):
+            if record is None:
+                continue
+            tasks.append(
+                Task(
+                    id=row_id,
+                    text=str(record.get("t", "")),
+                    done=bool(record.get("x", 0)),
+                    created_at=str(record.get("d", "")),
+                )
+            )
+        open_tasks = [t for t in tasks if not t.done]
+        done_tasks = [t for t in tasks if t.done]
+        return open_tasks + list(reversed(done_tasks))
+
+    def set_task_done(self, task_id: int, done: bool) -> bool:
+        record = dict(self._fetch("tasks")).get(task_id)
+        if record is None:
+            return False
+        record["x"] = 1 if done else 0
+        return self._update("tasks", task_id, record)
+
+    def delete_task(self, task_id: int) -> bool:
+        return self._remove("tasks", task_id)
+
+    def clear_done_tasks(self) -> int:
+        removed = 0
+        for task in self.list_tasks():
+            if task.done and self._remove("tasks", task.id):
+                removed += 1
+        return removed
+
+    # ----- reminders and deadlines ---------------------------------------------
+
+    def add_reminder(self, title: str, due: str = "") -> Optional[int]:
+        """Save a reminder or deadline. `due` is YYYY-MM-DD or empty."""
+        title = _clean(title, MAX_REMINDER_CHARS)
+        if not title or looks_sensitive(title):
+            return None
+        due = normalize_due(due)
+        existing = {(r.title.casefold(), r.due) for r in self.list_reminders()}
+        if (title.casefold(), due) in existing:
+            return None
+        return self._insert("reminders", {"t": title, "u": due, "d": _now()})
+
+    def list_reminders(self) -> List[Reminder]:
+        """Sorted by urgency: earliest date first (overdue first), undated last."""
+        reminders: List[Reminder] = []
+        for row_id, record in self._fetch("reminders"):
+            if record is None:
+                continue
+            reminders.append(
+                Reminder(
+                    id=row_id,
+                    title=str(record.get("t", "")),
+                    due=normalize_due(record.get("u", "")),
+                    created_at=str(record.get("d", "")),
+                )
+            )
+        reminders.sort(key=lambda r: (r.due == "", r.due, r.id))
+        return reminders
+
+    def delete_reminder(self, reminder_id: int) -> bool:
+        return self._remove("reminders", reminder_id)
+
+    # ----- security log ---------------------------------------------------------
+
+    def add_log(self, event: str, detail: str = "") -> int:
+        return self._insert(
+            "security_log",
+            {"e": _clean(event, 40), "t": _clean(detail, MAX_LOG_DETAIL_CHARS), "d": _now_seconds()},
+        )
+
+    def list_log(self, limit: int = 100) -> List[LogEntry]:
+        """Security events, newest first."""
+        entries: List[LogEntry] = []
+        for row_id, record in reversed(self._fetch("security_log")):
+            if record is None:
+                continue
+            entries.append(
+                LogEntry(
+                    id=row_id,
+                    timestamp=str(record.get("d", "")),
+                    event=str(record.get("e", "")),
+                    detail=str(record.get("t", "")),
+                )
+            )
+            if len(entries) >= limit:
+                break
+        return entries
+
+    def count_log(self, event: str) -> int:
+        return sum(1 for entry in self.list_log(limit=10_000) if entry.event == event)
+
+    def clear_log(self) -> int:
+        return self._wipe("security_log")

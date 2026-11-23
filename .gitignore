@@ -4,3 +4,6 @@ gideon.key
 gideon_vault.db
 gideon_vault.db-journal
 voiceprint.enc
+
+voiceprint.enc
+models/
