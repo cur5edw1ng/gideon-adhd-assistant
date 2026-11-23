@@ -1,17 +1,24 @@
 """
-Gideon - Level 3: Time Vault HUD, Offline Voice, and Voice Lock
+Gideon - Level 3.5: Conversation, Hands-Free Voice, and Speed
 
-Everything from Level 2 is still here: encrypted vault, per-memory delete,
-8192-token context with an 8-message window, and Focus Mode. New in Level 3:
+Everything from Level 3 is still here (Time Vault HUD, encrypted vault, Focus
+Mode, Kokoro voice, Whisper, Voice Lock). New in Level 3.5:
 
-  - A three-panel Time Vault console (tasks | Gideon core | deadlines).
-  - Offline speech to text (faster-whisper) for dictation and voice commands.
-  - Offline spoken replies (Kokoro) with an instant mute toggle.
-  - A speaker biometric Voice Lock with an encrypted voiceprint and security log.
+  - Two response modes in ONE fast model call: "chat" for normal conversation
+    and "plan" when you dump tasks, goals, or deadlines. Chat never touches your
+    tasks or deadlines.
+  - Instant Voice Command is the default: stop recording and Gideon verifies your
+    voice, transcribes, answers, and speaks, with no Send click.
+  - The text box clears after every message, and the voice recorder keeps
+    working for turn after turn.
+  - Engines (Whisper, Kokoro, SpeechBrain, and the Ollama model) are loaded once
+    in the background and stay warm; replies are capped at 300 tokens.
 
 Everything runs on this computer. No cloud services, no API keys.
 
 Run with:
+  python desktop.py
+or, in a browser:
   streamlit run app.py --server.address localhost --browser.gatherUsageStats false
 """
 
@@ -24,11 +31,12 @@ import sqlite3
 import time
 from dataclasses import replace
 from datetime import date, datetime, timedelta
-from typing import List, Literal, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple
 
+import numpy as np
 import streamlit as st
 from ollama import Client, ResponseError
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 import voice_io
 import voicelock
@@ -42,15 +50,16 @@ from vault import MAX_MEMORY_CHARS, UNREADABLE, VALID_CATEGORIES, Vault, VaultEr
 OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen2.5:3b"
 NUM_CTX = 8192
+PREDICT_LIMITS = (300, 600, 900)  # first try is short and fast; retries get more room
 MAX_HISTORY_MESSAGES = 8
 MAX_INPUT_CHARS = 4000
 MAX_ATTEMPTS = 3
-REQUEST_TIMEOUT_SECONDS = 300  # the first request can be slow while the model loads
-KEEP_ALIVE = "10m"  # keep the model in RAM between requests so replies stay fast
+REQUEST_TIMEOUT_SECONDS = 300  # the very first request can be slow while the model loads
+KEEP_ALIVE = "30m"  # keep the model in RAM between turns so replies stay fast
 
 VIEWS = ["Console", "Focus Mode", "Memory Vault", "Voice Security"]
+COMMAND = "Instant voice command"
 DICTATE = "Dictate to text"
-COMMAND = "Voice command"
 ACCESS_DENIED_MESSAGE = "Access denied. Vocal signature does not match the authorized user."
 
 PERSONA_PROMPT = """You are G.I.D.E.O.N., a calm, composed, courteous artificial intelligence assistant, in the manner of Gideon from The Flash. You help one person who gets overwhelmed, stuck, and loses track of time. Your replies are spoken aloud, so write plain text with no markdown, no symbols, and no emojis.
@@ -61,11 +70,15 @@ Voice and cadence:
 - Never use exclamation marks, slang, sarcasm, or lectures. Never shame the user. Never mention medical conditions.
 - Be concise. The user is easily overwhelmed by long text.
 
-The user will give you a messy "brain dump". Your job:
-1. Pick exactly ONE thing to focus on right now. Choose the most urgent or important item; the nearest deadline wins. If nothing is urgent, choose the item that is easiest to start. Use the saved notes below, if any, to judge what matters to this person.
+First decide the "mode" of your answer:
+
+mode "chat": greetings, small talk, questions about you, general questions, study help, explanations, opinions, or anything that is not a list of things to do. Reply naturally in your calm voice, in at most 4 short sentences and under 70 words. Never invent tasks or deadlines. If asked what you can do, explain briefly that you can turn a messy brain dump into three small steps with time estimates, track tasks and deadlines, run a focus timer, remember goals in an encrypted local vault, listen and speak without the internet, and lock voice input to the user's own voice. In chat mode return ONLY "mode" and "reply".
+
+mode "plan": the user dumps tasks, goals, or deadlines, or asks for help starting or organizing work. In plan mode return "mode", "reply", "focus", "steps", "parked", "memories", and "reminders". Your job:
+1. Pick exactly ONE thing to focus on right now. Choose the most urgent or important item; the nearest deadline wins. If nothing is urgent, choose the item that is easiest to start. Use the background notes below, if any, to judge what matters to this person.
 2. Break that one thing into exactly 3 micro-steps, in the order they should be done.
 3. Give each step a realistic time estimate in whole minutes.
-4. Put every other task from the brain dump into "parked" so the user can let go of it for now.
+4. Put every other task from the message into "parked" so the user can let go of it for now.
 5. Extract up to 3 NEW durable memories worth keeping for future sessions.
 6. Extract up to 4 reminders: deadlines, exam dates, and things the user must not forget on a specific day.
 
@@ -73,15 +86,15 @@ Rules for the micro-steps:
 - Each step is one concrete physical action that starts with a verb (for example "Open your laptop and the assignment file").
 - A step must not need any decisions, planning, or willpower to begin.
 - Step 1 must be very easy and take 5 minutes or less. Its only job is to break task paralysis.
-- Keep each step under 20 words, in plain direct language without the persona flourish.
+- Keep each step under 15 words, in plain direct language without the persona flourish.
 - Time estimates must be honest. People tend to underestimate time, so include setup time and round up a little. Use whole minutes between 1 and 30.
 
-Rules for "calm_message": at most 3 short sentences and under 45 words. Open with the greeting given below, state what you analyzed, and name the objective you isolated.
+Rules for "reply" in plan mode: at most 3 short sentences and under 45 words. State what you analyzed and name the objective you isolated.
 Rules for "focus": a short phrase naming the one thing you chose (under 12 words).
 Rules for "parked": a short phrase per leftover task. Use an empty list if there is nothing else. Do not repeat tasks already tracked.
 Rules for "memories":
 - Only durable facts: goals, ongoing projects, courses or coursework, and stable personal context such as year of study or major.
-- Do not save one-off chores, and do not repeat anything already in the saved notes.
+- Do not save one-off chores, and do not repeat anything already in the background notes.
 - Never include passwords, ID numbers, financial details, phone numbers, email addresses, health details, or private details about other people.
 - Each memory is a short phrase under 20 words, for example "Studying 23CSE101 recursion lab". Use category goal, project, coursework, or context.
 - Use an empty list when nothing durable was mentioned.
@@ -129,43 +142,50 @@ class ReminderItem(BaseModel):
     due_date: str = Field(description="YYYY-MM-DD, or an empty string if no date was given.")
 
 
-class Breakdown(BaseModel):
-    calm_message: str = Field(description="At most 3 short sentences in Gideon's calm, formal voice.")
-    focus: str = Field(description="Short phrase naming the one thing chosen to focus on.")
-    steps: List[MicroStep] = Field(description="Exactly 3 micro-steps, in order.")
-    parked: List[str] = Field(description="Other tasks from the brain dump, parked for later. Empty list if none.")
-    memories: List[MemoryItem] = Field(description="Up to 3 new durable memories. Empty list if none.")
-    reminders: List[ReminderItem] = Field(description="Up to 4 deadlines or reminders. Empty list if none.")
+class GideonReply(BaseModel):
+    mode: Literal["chat", "plan"] = Field(
+        description="chat for conversation and questions; plan when the user dumps tasks, goals, or deadlines."
+    )
+    reply: str = Field(description="What Gideon says aloud, in her calm voice. Plain text.")
+    focus: str = Field(default="", description="Plan mode only: short phrase naming the one chosen objective.")
+    steps: List[MicroStep] = Field(default_factory=list, description="Plan mode only: exactly 3 micro-steps.")
+    parked: List[str] = Field(default_factory=list, description="Plan mode only: other tasks, parked for later.")
+    memories: List[MemoryItem] = Field(default_factory=list, description="Plan mode only: up to 3 durable memories.")
+    reminders: List[ReminderItem] = Field(
+        default_factory=list, description="Plan mode only: up to 4 deadlines or reminders."
+    )
 
-    @field_validator("calm_message", "focus")
+    @field_validator("reply")
     @classmethod
-    def clean_text(cls, value: str) -> str:
+    def clean_reply(cls, value: str) -> str:
         value = value.strip()
         if not value:
-            raise ValueError("text must not be empty")
+            raise ValueError("reply must not be empty")
         return value
 
-    @field_validator("steps")
+    @field_validator("focus")
     @classmethod
-    def exactly_three_steps(cls, value: List[MicroStep]) -> List[MicroStep]:
-        if len(value) != 3:
-            raise ValueError("steps must contain exactly 3 items")
-        return value
+    def clean_focus(cls, value: str) -> str:
+        return value.strip()
 
-    @field_validator("parked")
-    @classmethod
-    def clean_parked(cls, value: List[str]) -> List[str]:
-        return [item.strip() for item in value if item and item.strip()][:8]
-
-    @field_validator("memories")
-    @classmethod
-    def limit_memories(cls, value: List[MemoryItem]) -> List[MemoryItem]:
-        return value[:3]
-
-    @field_validator("reminders")
-    @classmethod
-    def limit_reminders(cls, value: List[ReminderItem]) -> List[ReminderItem]:
-        return value[:4]
+    @model_validator(mode="after")
+    def enforce_mode(self) -> "GideonReply":
+        if self.mode == "plan":
+            if not self.focus:
+                raise ValueError("a plan needs a focus")
+            if len(self.steps) != 3:
+                raise ValueError("a plan needs exactly 3 steps")
+            self.parked = [item.strip() for item in self.parked if item and item.strip()][:8]
+            self.memories = self.memories[:3]
+            self.reminders = self.reminders[:4]
+        else:
+            # Chat never changes tasks, deadlines, or memories.
+            self.focus = ""
+            self.steps = []
+            self.parked = []
+            self.memories = []
+            self.reminders = []
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -204,13 +224,16 @@ def build_context(vault: Vault) -> str:
     return "\n\n".join(parts)
 
 
-def build_system_prompt(context: str) -> str:
+def build_system_prompt(context: str, first_message: bool) -> str:
     now = datetime.now()
-    today = now.date()
+    if first_message:
+        greeting_rule = f'This is the first message of the session. Open your reply with exactly: "{greeting_for(now)}."'
+    else:
+        greeting_rule = "This is a continuing conversation. Do not greet the user again."
     header = (
         f"\n\nCurrent local date and time: {now.strftime('%A, %d %B %Y, %H:%M')}.\n"
-        f"Calendar for resolving dates (today first): {calendar_hint(today)}.\n"
-        f'Begin calm_message with exactly: "{greeting_for(now)}."\n'
+        f"Calendar for resolving dates (today first): {calendar_hint(now.date())}.\n"
+        f"{greeting_rule}\n"
     )
     if context:
         notes = (
@@ -223,10 +246,6 @@ def build_system_prompt(context: str) -> str:
     return PERSONA_PROMPT + header + notes
 
 
-def format_user_message(brain_dump: str) -> str:
-    return f'Here is my brain dump:\n"""\n{brain_dump}\n"""'
-
-
 def installed_models(client: Client) -> List[str]:
     """Return the names of chat models already pulled into Ollama (empty if unreachable)."""
     try:
@@ -237,47 +256,48 @@ def installed_models(client: Client) -> List[str]:
         return []
 
 
-def break_down(
+def ask_gideon(
     client: Client,
     model: str,
     system_prompt: str,
     history: List[dict],
-    brain_dump: str,
-) -> Breakdown:
-    """Ask the local model for a validated 3-step breakdown, retrying if the format is off."""
-    messages = (
-        [{"role": "system", "content": system_prompt}]
-        + list(history)
-        + [{"role": "user", "content": format_user_message(brain_dump)}]
-    )
+    text: str,
+) -> GideonReply:
+    """One model call that returns either a chat reply or a plan. Retries with more room if the JSON is cut off."""
+    messages = [{"role": "system", "content": system_prompt}] + list(history) + [{"role": "user", "content": text}]
     last_error: Exception | None = None
 
-    for _ in range(MAX_ATTEMPTS):
+    for attempt in range(MAX_ATTEMPTS):
         response = client.chat(
             model=model,
             messages=messages,
-            format=Breakdown.model_json_schema(),
-            options={"temperature": 0.3, "num_ctx": NUM_CTX},
+            format=GideonReply.model_json_schema(),
+            options={
+                "temperature": 0.3,
+                "num_ctx": NUM_CTX,
+                "num_predict": PREDICT_LIMITS[min(attempt, len(PREDICT_LIMITS) - 1)],
+            },
             keep_alive=KEEP_ALIVE,
         )
         raw = response["message"]["content"]
         try:
-            return Breakdown.model_validate_json(raw)
+            return GideonReply.model_validate_json(raw)
         except ValidationError as exc:
             last_error = exc
-            messages = messages + [
-                {"role": "assistant", "content": raw},
-                {
-                    "role": "user",
-                    "content": (
-                        "That answer did not match the required format. Return exactly 3 steps, "
-                        "each with an action and whole minutes, plus calm_message, focus, parked, "
-                        "memories, and reminders. JSON only."
-                    ),
-                },
-            ]
+            if attempt >= 1:
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": (
+                            "That did not match the required format. Answer again as JSON: mode chat needs only "
+                            "mode and reply; mode plan needs reply, focus, exactly 3 steps, parked, memories, "
+                            "and reminders."
+                        ),
+                    },
+                ]
 
-    raise ValueError(f"The model could not produce a valid breakdown after {MAX_ATTEMPTS} tries: {last_error}")
+    raise ValueError(f"The model could not produce a valid answer after {MAX_ATTEMPTS} tries: {last_error}")
 
 
 def explain_error(exc: Exception, model: str) -> str:
@@ -293,7 +313,7 @@ def explain_error(exc: Exception, model: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Cached engines (each loads only when first needed)
+# Cached engines: loaded once, kept warm for every voice turn
 # --------------------------------------------------------------------------
 
 
@@ -307,19 +327,49 @@ def get_vault() -> Vault:
     return Vault()
 
 
-@st.cache_resource(show_spinner="Loading speech recognition (first time only)...")
+def load_speaker_engine() -> Tuple[Optional[voicelock.SpeakerEncoder], str]:
+    """Load the speaker model and run one dummy embedding so the first verification is fast."""
+    encoder, error = voicelock.load_encoder()
+    if encoder is not None:
+        try:
+            noise = np.random.default_rng(0).normal(0.0, 0.1, voice_io.TARGET_SR).astype(np.float32)
+            encoder.embed(noise)
+        except Exception:
+            pass  # warm-up is only an optimisation
+    return encoder, error
+
+
+def make_llm_warmup(client: Client, model: str) -> Callable[[], Tuple[object, str]]:
+    """A loader that makes Ollama load the model into RAM with the same context size we use later."""
+
+    def loader() -> Tuple[object, str]:
+        try:
+            client.chat(
+                model=model,
+                messages=[{"role": "user", "content": "Hello"}],
+                options={"num_ctx": NUM_CTX, "num_predict": 1},
+                keep_alive=KEEP_ALIVE,
+            )
+            return True, ""
+        except Exception as exc:
+            return None, str(exc)
+
+    return loader
+
+
+@st.cache_resource(show_spinner="Loading speech recognition...")
 def get_transcriber():
-    return voice_io.load_transcriber()
+    return voice_io.cached_engine("stt", voice_io.load_transcriber)
 
 
-@st.cache_resource(show_spinner="Loading Gideon's voice (first time only)...")
+@st.cache_resource(show_spinner="Loading Gideon's voice...")
 def get_synthesizer():
-    return voice_io.load_synthesizer()
+    return voice_io.cached_engine("tts", voice_io.load_synthesizer)
 
 
-@st.cache_resource(show_spinner="Loading the speaker model (first time only)...")
+@st.cache_resource(show_spinner="Loading the speaker model...")
 def get_speaker_encoder():
-    return voicelock.load_encoder()
+    return voice_io.cached_engine("speaker", load_speaker_engine)
 
 
 # --------------------------------------------------------------------------
@@ -337,7 +387,11 @@ def init_state(vault: Vault) -> None:
         pass
 
     defaults = {
-        "result": None,
+        "result": None,  # the active plan (a GideonReply in plan mode)
+        "last_reply": None,
+        "last_mode": None,
+        "last_user_text": None,
+        "timing": None,
         "error": None,
         "history": [],
         "saved_now": [],
@@ -350,7 +404,6 @@ def init_state(vault: Vault) -> None:
         "voice_notice": None,
         "lock_enabled": voicelock.voiceprint_exists(),  # secure by default after every restart
         "lock_threshold": lock_threshold,
-        "mic_nonce": 0,
         "enroll_nonce": 0,
         "last_audio_digest": None,
         "pending_audio": None,
@@ -373,33 +426,34 @@ def reset_timer() -> None:
     st.session_state.timer_total = 0.0
 
 
-def load_plan(result: Breakdown) -> None:
-    st.session_state.result = result
+def load_plan(plan: GideonReply) -> None:
+    st.session_state.result = plan
     st.session_state.done = [False, False, False]
     st.session_state.focus_index = 0
     reset_timer()
 
 
-def remember_exchange(brain_dump: str, result: Breakdown) -> None:
+def remember_exchange(user_text: str, reply: GideonReply) -> None:
     """Append this exchange and keep only the most recent messages (sliding window)."""
+    fields = {"mode", "reply", "focus", "steps"} if reply.mode == "plan" else {"mode", "reply"}
     history = st.session_state.history + [
-        {"role": "user", "content": format_user_message(brain_dump)},
-        {"role": "assistant", "content": result.model_dump_json()},
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": reply.model_dump_json(include=fields)},
     ]
     st.session_state.history = history[-MAX_HISTORY_MESSAGES:]
 
 
-def save_to_vault(vault: Vault, result: Breakdown) -> List[str]:
+def save_to_vault(vault: Vault, plan: GideonReply) -> List[str]:
     """Encrypt and store new memories, tasks, and deadlines. Returns short descriptions of what was saved."""
     saved: List[str] = []
     try:
-        for item in result.memories:
+        for item in plan.memories:
             if vault.add(item.category, item.text) is not None:
                 saved.append(f"memory: {item.text}")
-        for text in [result.focus] + result.parked:
+        for text in [plan.focus] + plan.parked:
             if vault.add_task(text) is not None:
                 saved.append(f"task: {text}")
-        for item in result.reminders:
+        for item in plan.reminders:
             if vault.add_reminder(item.title, item.due_date) is not None:
                 saved.append(f"deadline: {item.title}")
     except (sqlite3.Error, OSError):
@@ -407,21 +461,22 @@ def save_to_vault(vault: Vault, result: Breakdown) -> List[str]:
     return saved
 
 
-def speech_for(result: Breakdown) -> str:
-    first = result.steps[0]
+def speech_for(plan: GideonReply) -> str:
+    first = plan.steps[0]
     action = first.action.rstrip(".!? ")
-    return f"{result.calm_message} Your first action: {action}. It should take about {first.minutes} minutes."
+    return f"{plan.reply} Your first action: {action}. It should take about {first.minutes} minutes."
 
 
-def queue_speech(text: str) -> None:
-    """Synthesize speech and queue it for playback. Does nothing while Gideon is muted."""
+def queue_speech(text: str) -> float:
+    """Synthesize speech and queue it for playback. Returns synthesis seconds (0 when muted or unavailable)."""
     st.session_state.voice_notice = None
     if not st.session_state.voice_on:
-        return
+        return 0.0
     engine, error = get_synthesizer()
     if engine is None:
         st.session_state.voice_notice = error
-        return
+        return 0.0
+    started = time.perf_counter()
     try:
         speech = engine.speak(
             text,
@@ -430,12 +485,13 @@ def queue_speech(text: str) -> None:
         )
     except Exception as exc:
         st.session_state.voice_notice = f"Voice output failed: {exc}"
-        return
+        return 0.0
     if speech.wav:
         st.session_state.pending_audio = speech.wav
         st.session_state.pending_seconds = speech.seconds
         st.session_state.last_audio = speech.wav
         st.session_state.last_seconds = speech.seconds
+    return time.perf_counter() - started
 
 
 # --------------------------------------------------------------------------
@@ -443,8 +499,22 @@ def queue_speech(text: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def queue_typed_message() -> None:
+    """Send button: take the typed text, clear the box, and run it on the next pass."""
+    text = st.session_state.get("brain_dump_text", "").strip()
+    st.session_state.brain_dump_text = ""
+    if text:
+        st.session_state.queued_text = text
+    else:
+        st.session_state.error = "Type or dictate something first. It can be messy."
+
+
 def clear_plan() -> None:
     st.session_state.result = None
+    st.session_state.last_reply = None
+    st.session_state.last_mode = None
+    st.session_state.last_user_text = None
+    st.session_state.timing = None
     st.session_state.error = None
     st.session_state.saved_now = []
     st.session_state.denied = None
@@ -458,8 +528,9 @@ def forget_conversation() -> None:
 
 
 def reload_engines() -> None:
+    voice_io.clear_engines()
     st.cache_resource.clear()
-    st.toast("Voice engines will reload the next time they are used.")
+    st.toast("Voice engines will reload in the background.")
 
 
 def enter_focus_mode() -> None:
@@ -529,9 +600,9 @@ def complete_step() -> None:
     reset_timer()
 
     # Finishing the last micro-step also checks off the matching task in the vault.
-    result = st.session_state.result
-    if result is not None and index == len(result.steps) - 1:
-        focus_text = " ".join(result.focus.split())[:160].casefold()
+    plan = st.session_state.result
+    if plan is not None and index == len(plan.steps) - 1:
+        focus_text = " ".join(plan.focus.split())[:160].casefold()
         try:
             vault = get_vault()
             for task in vault.list_tasks():
@@ -585,7 +656,7 @@ def clear_security_log(vault: Vault) -> None:
 
 
 # --------------------------------------------------------------------------
-# Voice input pipeline
+# Voice input pipeline: lock check -> transcription -> Gideon -> spoken reply
 # --------------------------------------------------------------------------
 
 
@@ -607,16 +678,16 @@ def verify_speaker(vault: Vault, wav) -> voicelock.VerifyResult:
 
 
 def handle_microphone(audio_file, mode: str, vault: Vault, orb_slot) -> Optional[str]:
-    """Process a new recording. Returns text to submit right away (voice command mode), else None."""
+    """Process a new recording. Returns text to run immediately (instant mode), else None."""
     audio_bytes = audio_file.getvalue()
     digest = hashlib.sha256(audio_bytes).hexdigest()
     if digest == st.session_state.last_audio_digest:
         return None  # this recording was already handled on an earlier rerun
     st.session_state.last_audio_digest = digest
-    st.session_state.mic_nonce += 1  # gives the next rerun a fresh, empty recorder
     st.session_state.denied = None
     st.session_state.heard = None
     st.session_state.error = None
+    started = time.perf_counter()
 
     try:
         wav = voice_io.wav_bytes_to_mono16k(audio_bytes)
@@ -662,6 +733,7 @@ def handle_microphone(audio_file, mode: str, vault: Vault, orb_slot) -> Optional
         st.session_state.error = "I did not catch any speech. Please try again."
         return None
 
+    st.session_state.stt_seconds = time.perf_counter() - started
     st.session_state.heard = text
     if mode == DICTATE:
         existing = st.session_state.get("brain_dump_text", "").strip()
@@ -670,25 +742,54 @@ def handle_microphone(audio_file, mode: str, vault: Vault, orb_slot) -> Optional
     return text
 
 
-def run_gideon(text: str, vault: Vault, client: Client, model: str, remember: bool, orb_slot) -> None:
-    """Generate the plan, save extracted items to the vault, and queue Gideon's spoken reply."""
+def run_gideon(
+    text: str,
+    vault: Vault,
+    client: Client,
+    model: str,
+    remember: bool,
+    orb_slot,
+    heard_seconds: Optional[float],
+) -> None:
+    """One model call decides chat or plan. Plans update the vault; chat only replies. Then Gideon speaks."""
     st.session_state.denied = None
-    orb_slot.markdown(orb_html("thinking", "Analyzing your workload"), unsafe_allow_html=True)
-    with st.spinner("Analyzing your workload..."):
-        try:
-            system_prompt = build_system_prompt(build_context(vault))
-            result = break_down(client, model, system_prompt, st.session_state.history, text)
-        except Exception as exc:  # show a friendly message instead of a stack trace
-            st.session_state.result = None
-            st.session_state.error = explain_error(exc, model)
-            return
-        load_plan(result)
-        remember_exchange(text, result)
-        st.session_state.saved_now = save_to_vault(vault, result) if remember else []
-        st.session_state.error = None
+    st.session_state.error = None
+    st.session_state.last_user_text = text
+    orb_slot.markdown(orb_html("thinking", "Thinking"), unsafe_allow_html=True)
+
+    started = time.perf_counter()
+    try:
+        context = build_context(vault)
+        system_prompt = build_system_prompt(context, first_message=not st.session_state.history)
+        reply = ask_gideon(client, model, system_prompt, st.session_state.history, text)
+    except Exception as exc:  # show a friendly message instead of a stack trace
+        st.session_state.error = explain_error(exc, model)
+        return
+    reply_seconds = time.perf_counter() - started
+
+    remember_exchange(text, reply)
+    st.session_state.last_reply = reply.reply
+    st.session_state.last_mode = reply.mode
+
+    if reply.mode == "plan":
+        load_plan(reply)
+        st.session_state.saved_now = save_to_vault(vault, reply) if remember else []
+        spoken = speech_for(reply)
+    else:
+        st.session_state.saved_now = []
+        spoken = reply.reply
+
     if st.session_state.voice_on:
         orb_slot.markdown(orb_html("thinking", "Preparing voice"), unsafe_allow_html=True)
-    queue_speech(speech_for(result))
+    voice_seconds = queue_speech(spoken)
+
+    parts: List[str] = []
+    if heard_seconds is not None:
+        parts.append(f"heard {heard_seconds:.1f}s")
+    parts.append(f"replied {reply_seconds:.1f}s")
+    if voice_seconds > 0:
+        parts.append(f"voice {voice_seconds:.1f}s")
+    st.session_state.timing = " · ".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -722,27 +823,50 @@ def lock_status_text() -> str:
     return "Voice lock: not set up"
 
 
-def render_response(result: Breakdown) -> None:
-    st.markdown(f'<div class="gideon-msg">{html.escape(result.calm_message)}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="gideon-focus">{html.escape(result.focus)}</div>', unsafe_allow_html=True)
+def render_response() -> None:
+    """Gideon's latest reply (chat or plan), plus the active plan controls if there is one."""
+    user_text = st.session_state.last_user_text
+    reply = st.session_state.last_reply
+    plan = st.session_state.result
+
+    if user_text:
+        shown = user_text if len(user_text) <= 140 else user_text[:137] + "..."
+        st.caption(f"You: {shown}")
+
+    if reply:
+        st.markdown(f'<div class="gideon-msg">{html.escape(reply)}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f'<div class="gideon-msg">{html.escape(greeting_for(datetime.now()))}. '
+            "I am ready when you are. Speak or type, and I will listen.</div>",
+            unsafe_allow_html=True,
+        )
+
+    if plan is None:
+        return
+
+    if st.session_state.last_mode == "plan":
+        st.markdown(f'<div class="gideon-focus">{html.escape(plan.focus)}</div>', unsafe_allow_html=True)
+    else:
+        st.caption(f"Active plan: {plan.focus}")
 
     if st.session_state.saved_now:
-        shown = st.session_state.saved_now[:6]
-        st.caption("Saved to your encrypted vault: " + "; ".join(shown))
+        st.caption("Saved to your encrypted vault: " + "; ".join(st.session_state.saved_now[:6]))
 
-    done_count = sum(st.session_state.done)
-    if done_count == 3:
+    if sum(st.session_state.done) == 3:
         st.success("All three micro-steps are complete. That is measurable progress.")
+        st.button("Start fresh", on_click=clear_plan)
     else:
-        st.button("Enter Focus Mode", type="primary", on_click=enter_focus_mode)
-    st.button("Start fresh", on_click=clear_plan)
+        button_col, fresh_col = st.columns([1, 1])
+        button_col.button("Enter Focus Mode", type="primary", on_click=enter_focus_mode)
+        fresh_col.button("Start fresh", on_click=clear_plan)
 
 
-def render_micro_steps(result: Breakdown) -> None:
+def render_micro_steps(plan: GideonReply) -> None:
     done = st.session_state.done
     focus_index = st.session_state.focus_index
-    st.caption(f"Now: {result.focus}")
-    for index, step in enumerate(result.steps):
+    st.caption(f"Now: {plan.focus}")
+    for index, step in enumerate(plan.steps):
         if done[index]:
             marker, text = "✓", f"~~{step.action}~~"
         elif index == focus_index:
@@ -759,12 +883,17 @@ def render_tasks(vault: Vault) -> None:
 
     st.caption("Open tasks")
     if not open_tasks:
-        st.markdown('<div class="panel-note">Nothing open. Mention what you need to do and I will track it.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="panel-note">Nothing open. Mention what you need to do and I will track it.</div>',
+            unsafe_allow_html=True,
+        )
     for task in open_tasks:
         key = f"task_{task.id}_0"
         check_col, delete_col = st.columns([6, 1])
         check_col.checkbox(task.text, value=False, key=key, on_change=toggle_task, args=(vault, task.id, key))
-        delete_col.button("✕", key=f"deltask_{task.id}", on_click=delete_task, args=(vault, task.id), help="Remove this task")
+        delete_col.button(
+            "✕", key=f"deltask_{task.id}", on_click=delete_task, args=(vault, task.id), help="Remove this task"
+        )
 
     if done_tasks:
         with st.expander(f"Completed ({len(done_tasks)})"):
@@ -798,7 +927,7 @@ def render_reminders(vault: Vault) -> None:
 
 
 def render_console(vault: Vault, client: Client, model: str, remember: bool) -> None:
-    left, center, right = st.columns([1.05, 1.9, 1.05], gap="medium")
+    left, center, right = st.columns([1.0, 1.9, 1.0], gap="medium")
 
     # Layout slots are created first so they can be filled in any order below.
     with center:
@@ -809,45 +938,42 @@ def render_console(vault: Vault, client: Client, model: str, remember: bool) -> 
         text_zone = st.container()
         mic_zone = st.container()
 
+    queued_text = st.session_state.pop("queued_text", None)
+
     # 1) Microphone first: dictation writes into the text box before the box is drawn.
+    #    The recorder keeps one fixed key, so every new recording is picked up (turn after turn).
     with mic_zone:
-        st.caption("Or speak. Press record, talk, then press stop.")
-        mode = st.radio("Microphone mode", [DICTATE, COMMAND], horizontal=True, key="mic_mode", label_visibility="collapsed")
-        audio_file = st.audio_input(
-            "Record your voice", key=f"mic_{st.session_state.mic_nonce}", label_visibility="collapsed"
+        mode_col, record_col = st.columns([1, 1.7])
+        mode = mode_col.radio(
+            "Microphone mode", [COMMAND, DICTATE], key="mic_mode", label_visibility="collapsed"
         )
+        audio_file = record_col.audio_input("Record your voice", key="mic_input", label_visibility="collapsed")
+
     command_text = None
+    heard_seconds = None
     if audio_file is not None:
         with response_slot:
             command_text = handle_microphone(audio_file, mode, vault, orb_slot)
+        heard_seconds = st.session_state.pop("stt_seconds", None)
 
-    # 2) Text box and send button.
+    # 2) Text box and send button. The callback clears the box as soon as you press Send.
     with text_zone:
-        typed = st.text_area(
-            "Brain dump",
+        st.text_area(
+            "Message",
             key="brain_dump_text",
-            height=130,
+            height=90,
             max_chars=MAX_INPUT_CHARS,
-            placeholder=(
-                "Type a messy brain dump here, or dictate it with the microphone below. "
-                "Example: assignment due friday, haven't started, email prof, exam next week..."
-            ),
+            placeholder="Type to Gideon, or press record below. Ask anything, or dump your tasks and deadlines.",
             label_visibility="collapsed",
         )
-        send_clicked = st.button("Send to Gideon", type="primary", key="send_button")
+        st.button("Send to Gideon", type="primary", key="send_button", on_click=queue_typed_message)
 
-    # 3) Decide what to run.
-    submit_text = None
-    if command_text:
-        submit_text = command_text
-    elif send_clicked:
-        if typed.strip():
-            submit_text = typed.strip()
-        else:
-            st.session_state.error = "Type or dictate whatever is on your mind first. It can be messy."
+    # 3) Run whichever input arrived.
+    submit_text = queued_text or command_text
     if submit_text:
+        heard = heard_seconds if (command_text and submit_text == command_text) else None
         with response_slot:
-            run_gideon(submit_text, vault, client, model, remember, orb_slot)
+            run_gideon(submit_text, vault, client, model, remember, orb_slot, heard)
 
     # 4) Voice controls.
     with controls_slot:
@@ -857,6 +983,8 @@ def render_console(vault: Vault, client: Client, model: str, remember: bool) -> 
         )
         replay_col.button("Replay", on_click=replay_last, disabled=st.session_state.last_audio is None)
         lock_col.caption(lock_status_text())
+        if st.session_state.timing:
+            st.caption(st.session_state.timing)
         if st.session_state.voice_notice:
             st.caption(st.session_state.voice_notice)
 
@@ -868,14 +996,7 @@ def render_console(vault: Vault, client: Client, model: str, remember: bool) -> 
             st.error(st.session_state.error)
         if st.session_state.heard:
             st.caption(f"Heard: {st.session_state.heard}")
-        if st.session_state.result is not None:
-            render_response(st.session_state.result)
-        else:
-            st.markdown(
-                f'<div class="gideon-msg">{html.escape(greeting_for(datetime.now()))}. '
-                "I am ready when you are. Type or speak whatever is on your mind.</div>",
-                unsafe_allow_html=True,
-            )
+        render_response()
 
     # 6) Orb and queued speech (the speech element is shown once, then cleared).
     pending = st.session_state.pending_audio
@@ -914,17 +1035,17 @@ def render_console(vault: Vault, client: Client, model: str, remember: bool) -> 
 @st.fragment(run_every="1s")
 def render_focus_mode() -> None:
     """Shows one active micro-step with a live countdown. Only this fragment reruns each second."""
-    result = st.session_state.result
-    if result is None:
-        st.info("There is no active plan yet. Open the Console and send a brain dump.")
+    plan = st.session_state.result
+    if plan is None:
+        st.info("There is no active plan yet. Open the Console and tell Gideon what is on your mind.")
         return
 
-    steps = result.steps
+    steps = plan.steps
     index = st.session_state.focus_index
 
     if index >= len(steps):
         st.success("All three micro-steps are complete. Excellent work.")
-        st.caption("Open the Console whenever you want to start a new brain dump.")
+        st.caption("Open the Console whenever you want to start something new.")
         return
 
     step = steps[index]
@@ -943,7 +1064,7 @@ def render_focus_mode() -> None:
     seconds_left = math.ceil(remaining)
     minutes_part, seconds_part = divmod(seconds_left, 60)
 
-    st.caption(f"{result.focus}  ·  step {index + 1} of {len(steps)}")
+    st.caption(f"{plan.focus}  ·  step {index + 1} of {len(steps)}")
     st.markdown(f"### {step.action}")
     st.markdown(
         f'<div class="gideon-timer">{minutes_part:02d}:{seconds_part:02d}</div>',
@@ -1188,7 +1309,6 @@ def render_voice_security(vault: Vault) -> None:
         stored = voicelock.load_voiceprint(vault)
     except (VaultError, ValueError, KeyError, OSError) as exc:
         st.error(f"The voiceprint could not be read: {exc}")
-        stored = None
         if st.button("Erase the unreadable voiceprint"):
             voicelock.delete_voiceprint()
             st.rerun()
@@ -1207,7 +1327,7 @@ def render_voice_security(vault: Vault) -> None:
 # App
 # --------------------------------------------------------------------------
 
-st.set_page_config(page_title="Gideon", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="GIDEON // Time Vault", page_icon="⚡", layout="wide")
 st.markdown(f"<style>{HUD_CSS}</style>", unsafe_allow_html=True)
 
 try:
@@ -1249,9 +1369,19 @@ with st.sidebar:
         "Your data and your voice never leave it."
     )
 
-title_col, view_col = st.columns([1, 2.4])
+# Warm every engine in the background (once per launch) so voice turns never hit a cold start.
+warmup_loaders = {
+    f"llm:{model}": make_llm_warmup(client, model),
+    "stt": voice_io.load_transcriber,
+    "tts": voice_io.load_synthesizer,
+}
+if voicelock.voiceprint_exists():
+    warmup_loaders["speaker"] = load_speaker_engine
+voice_io.start_warmup(warmup_loaders)
+
+title_col, view_col = st.columns([1.3, 2.4])
 title_col.markdown(
-    '<div class="hud-title">G.I.D.E.O.N.</div><div class="hud-sub">Time Vault console</div>',
+    '<div class="hud-title">GIDEON // TIME VAULT</div><div class="hud-sub">Local, private, offline</div>',
     unsafe_allow_html=True,
 )
 view = view_col.radio("View", VIEWS, horizontal=True, key="view", label_visibility="collapsed")

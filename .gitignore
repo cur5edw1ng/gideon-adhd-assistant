@@ -7,3 +7,6 @@ voiceprint.enc
 
 voiceprint.enc
 models/
+
+.webview/
+gideon_desktop.log

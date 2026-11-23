@@ -1,5 +1,5 @@
 """
-Gideon - Offline Voice Input and Output (Level 3)
+Gideon - Offline Voice Input and Output (Level 3.5)
 
 Speech to text:  faster-whisper (base.en, int8) running on the CPU.
 Text to speech:  kokoro-onnx (Kokoro v1.0) running on the CPU.
@@ -8,8 +8,13 @@ Nothing here talks to the internet at run time. The Whisper model is
 downloaded once (see the setup commands), and the Kokoro files live in the
 local `models` folder.
 
-Both engines load lazily on first use, so the app starts instantly even if you
-never touch the microphone.
+Speed design (Level 3.5):
+  - Engines live in a process-wide registry (`cached_engine`), so they are
+    loaded exactly once and survive every Streamlit rerun.
+  - `start_warmup` loads them in a background thread right after launch and
+    runs one tiny dummy inference, so the very first voice turn is already warm.
+  - This module never imports Streamlit, so the registry is safe to use from
+    background threads.
 """
 
 from __future__ import annotations
@@ -18,9 +23,10 @@ import importlib.util
 import io
 import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -40,7 +46,7 @@ TARGET_SR = 16000
 DEFAULT_VOICE = "bf_emma"
 DEFAULT_SPEED = 1.05
 VOICE_CHOICES = ["bf_emma", "af_bella", "af_heart", "bf_isabella", "af_nicole", "af_sarah"]
-MAX_SPEECH_CHARS = 360
+MAX_SPEECH_CHARS = 320
 
 
 def package_available(name: str) -> bool:
@@ -55,6 +61,55 @@ def kokoro_files_ready() -> bool:
 def _require_soundfile() -> None:
     if sf is None:
         raise RuntimeError("The 'soundfile' package is missing. Run: pip install soundfile")
+
+
+# --------------------------------------------------------------------------
+# Process-wide engine registry (load once, reuse forever)
+# --------------------------------------------------------------------------
+
+_ENGINES: Dict[str, Tuple[Any, str]] = {}
+_ENGINE_LOCKS: Dict[str, threading.Lock] = {}
+_REGISTRY_LOCK = threading.Lock()
+_WARMUP_STARTED = False
+
+
+def cached_engine(name: str, loader: Callable[[], Tuple[Any, str]]) -> Tuple[Any, str]:
+    """Return (engine, error) for `name`, running `loader` only the first time.
+
+    Each name has its own lock, so a slow load of one engine never blocks the others.
+    """
+    with _REGISTRY_LOCK:
+        lock = _ENGINE_LOCKS.setdefault(name, threading.Lock())
+    with lock:
+        if name not in _ENGINES:
+            _ENGINES[name] = loader()
+        return _ENGINES[name]
+
+
+def clear_engines() -> None:
+    """Forget every loaded engine (used by the Reload voice engines button)."""
+    global _WARMUP_STARTED
+    with _REGISTRY_LOCK:
+        _ENGINES.clear()
+        _WARMUP_STARTED = False
+
+
+def start_warmup(loaders: Dict[str, Callable[[], Tuple[Any, str]]]) -> None:
+    """Load engines one after another in a background daemon thread. Runs once per process."""
+    global _WARMUP_STARTED
+    with _REGISTRY_LOCK:
+        if _WARMUP_STARTED:
+            return
+        _WARMUP_STARTED = True
+
+    def worker() -> None:
+        for name, loader in loaders.items():
+            try:
+                cached_engine(name, loader)
+            except Exception:
+                continue  # a failed warm-up must never crash the app
+
+    threading.Thread(target=worker, name="gideon-warmup", daemon=True).start()
 
 
 # --------------------------------------------------------------------------
@@ -106,6 +161,15 @@ class Transcriber:
         threads = max(4, min(8, (os.cpu_count() or 8) // 2))
         self._model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=threads)
 
+    def warm_up(self) -> None:
+        """Run one dummy inference so the first real turn does not pay start-up costs."""
+        silence = np.zeros(TARGET_SR, dtype=np.float32)
+        segments, _info = self._model.transcribe(
+            silence, language="en", beam_size=1, vad_filter=False, without_timestamps=True
+        )
+        for _segment in segments:
+            pass
+
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe a mono 16 kHz float32 array. Returns "" if no speech was found."""
         if audio.size < int(TARGET_SR * 0.3):
@@ -115,6 +179,7 @@ class Transcriber:
             language="en",
             beam_size=1,
             vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 400},
             condition_on_previous_text=False,
             without_timestamps=True,
         )
@@ -126,13 +191,18 @@ def load_transcriber() -> Tuple[Optional[Transcriber], str]:
     if not package_available("faster_whisper"):
         return None, "faster-whisper is not installed. Run: pip install faster-whisper"
     try:
-        return Transcriber(), ""
+        engine = Transcriber()
     except Exception as exc:
         return None, (
             f"Speech recognition could not start ({type(exc).__name__}: {exc}). "
             f"The first run needs internet once to download the {WHISPER_MODEL} model; "
             "see the setup commands to pre-download it."
         )
+    try:
+        engine.warm_up()
+    except Exception:
+        pass  # warm-up is only an optimisation
+    return engine, ""
 
 
 # --------------------------------------------------------------------------
@@ -157,6 +227,10 @@ class Synthesizer:
 
         self._kokoro = Kokoro(str(KOKORO_MODEL_PATH), str(KOKORO_VOICES_PATH))
 
+    def warm_up(self) -> None:
+        """Synthesize one short phrase so the first spoken reply is fast."""
+        self.speak("Ready.", DEFAULT_VOICE, DEFAULT_SPEED)
+
     def speak(self, text: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> Speech:
         cleaned = clean_for_speech(text)
         if not cleaned:
@@ -177,6 +251,11 @@ def load_synthesizer() -> Tuple[Optional[Synthesizer], str]:
             "voices-v1.0.bin with the setup commands, then press Reload voice engines."
         )
     try:
-        return Synthesizer(), ""
+        engine = Synthesizer()
     except Exception as exc:
         return None, f"Voice output could not start ({type(exc).__name__}: {exc})"
+    try:
+        engine.warm_up()
+    except Exception:
+        pass  # warm-up is only an optimisation
+    return engine, ""
